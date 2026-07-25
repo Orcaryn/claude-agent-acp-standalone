@@ -76,6 +76,7 @@ import {
   Query,
   query,
   SDKAssistantMessageError,
+  SDKControlGetUsageResponse,
   SDKMessage,
   SDKMessageOrigin,
   SDKPartialAssistantMessage,
@@ -1262,6 +1263,33 @@ class ClientConnection implements AcpClient {
   }
 }
 
+/** One active claude.ai rate-limit window with an exact 0-100 utilization. */
+type UsageWindow = { key: string; utilization: number };
+
+/** Rate-limit windows the `_claude/usage` pull surfaces, most-constraining first. */
+const USAGE_WINDOW_KEYS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"] as const;
+
+/** Projects the structured /usage response into the small stable pull contract. */
+function extractUsageWindows(usage: SDKControlGetUsageResponse): UsageWindow[] {
+  const rateLimits = usage.rate_limits;
+
+  if (!rateLimits) {
+    return [];
+  }
+
+  const windows: UsageWindow[] = [];
+
+  for (const key of USAGE_WINDOW_KEYS) {
+    const window = rateLimits[key];
+
+    if (window && typeof window.utilization === "number") {
+      windows.push({ key, utilization: window.utilization });
+    }
+  }
+
+  return windows;
+}
+
 export class ClaudeAcpAgent {
   sessions: {
     [key: string]: Session;
@@ -1283,6 +1311,39 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+  }
+
+  /**
+   * Extension methods. `_claude/usage` exposes the structured `/usage` data
+   * (per-window rate-limit utilization) as an on-demand pull, mirroring Codex's
+   * `_codex/account/rate_limits`. Reuses a live session's query when one exists,
+   * else spins an ephemeral query just to issue the get_usage control request.
+   */
+  async extMethod(method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (method === "_claude/usage") {
+      return this.readUsageWindows();
+    }
+
+    throw RequestError.methodNotFound(method);
+  }
+
+  private async readUsageWindows(): Promise<{ windows: UsageWindow[] }> {
+    // Chapeta polls usage over a fresh, session-less connection, so there is no
+    // live turn to piggyback on — spin an ephemeral query just to issue the
+    // get_usage control request. An unfed `Pushable` keeps the query open (no
+    // turn runs); `close()` tears down its subprocess.
+    const usageQuery = query({
+      prompt: new Pushable<SDKUserMessage>(),
+      options: { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()) },
+    });
+
+    try {
+      const usage = await usageQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+
+      return { windows: extractUsageWindows(usage) };
+    } finally {
+      usageQuery.close();
+    }
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
