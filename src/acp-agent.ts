@@ -199,6 +199,9 @@ const TURN_NO_RESULT_MESSAGE =
  *  `InitializeResponse._meta.steering.supported`. */
 const STEER_METHOD = "_session/steering";
 
+/** Extension method returning the caller-requested claude.ai rate-limit windows. */
+const USAGE_METHOD = "_claude/usage";
+
 /** How urgently the SDK delivers a steered message relative to the running
  *  turn — an internal Claude implementation detail, not part of the wire
  *  contract. `now` pre-empts the current generation and handles the message
@@ -1283,6 +1286,29 @@ export class ClaudeAcpAgent {
     this.sessions = {};
     this.client = client;
     this.logger = logger ?? console;
+  }
+
+  /**
+   * Returns the caller-requested rate-limit windows straight from the SDK's
+   * structured /usage data. The caller passes the keys it wants (e.g. `["five_hour",
+   * "seven_day"]`) and gets back `{ [key]: rate_limits[key] }` — key selection and
+   * labelling stay entirely on the caller. An unfed `Pushable` holds the ephemeral
+   * query open long enough to issue the get_usage request.
+   */
+  async readUsage(keys: string[]): Promise<Record<string, unknown>> {
+    const usageQuery = query({
+      prompt: new Pushable<SDKUserMessage>(),
+      options: { pathToClaudeCodeExecutable: process.env.CLAUDE_CODE_EXECUTABLE ?? (await claudeCliPath()) },
+    });
+
+    try {
+      const usage = await usageQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET();
+      const rateLimits = (usage.rate_limits ?? {}) as Record<string, unknown>;
+
+      return Object.fromEntries(keys.map((key) => [key, rateLimits[key]]));
+    } finally {
+      usageQuery.close();
+    }
   }
 
   async initialize(request: InitializeRequest): Promise<InitializeResponse> {
@@ -7439,6 +7465,11 @@ export function runAcp() {
     .onNotification(methods.agent.session.cancel, (ctx) => agent.cancel(ctx.params))
     .onRequest<SteerRequest, SteerResponse>(STEER_METHOD, { parse: parseSteerRequest }, (ctx) =>
       agent.steer(ctx.params),
+    )
+    .onRequest<string[], Record<string, unknown>>(
+      USAGE_METHOD,
+      { parse: (params) => (params as { keys?: string[] })?.keys ?? [] },
+      (ctx) => agent.readUsage(ctx.params),
     )
     .connect(stream);
 
